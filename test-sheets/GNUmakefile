@@ -6,7 +6,7 @@ include $(GNUSTEP_MAKEFILES)/common.make
 
 GNUSTEP_OBJ_DIR=./obj
 
-TEST_TOOL_NAME =  attachmentregistry sheetlayout sheetslide windowrole
+TEST_TOOL_NAME =  attachmentregistry holdlastframe sheetlayout sheetslide windowrole
 
 ADDITIONAL_CPPFLAGS += -I$(GNUSTEP_MAKEFILES)/TestFramework
 
@@ -22,6 +22,7 @@ ADDITIONAL_OBJCCFLAGS += -Wno-deprecated
 
 
 attachmentregistry_OBJC_FILES=attachmentregistry.m
+holdlastframe_OBJC_FILES=holdlastframe.m
 sheetlayout_OBJC_FILES=sheetlayout.m
 sheetslide_OBJC_FILES=sheetslide.m
 windowrole_OBJC_FILES=windowrole.m

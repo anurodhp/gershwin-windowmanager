@@ -103,6 +103,12 @@ typedef void (^dispatch_block_t)(void);
 - (void)setKeepsContentAfterUnmap:(BOOL)keep forWindow:(xcb_window_t)windowId;
 // The effect running on the window, or the one whose last frame it keeps.
 - (id<URSWindowEffect>)effectOnWindow:(xcb_window_t)windowId;
+// Keeps windowId's own top-level picture on screen, unchanged, for
+// duration even if the window unmaps meanwhile - so a parent that is
+// closing while an attached window (a sheet, a drawer) is still playing
+// its own dismiss effect does not disappear before that effect finishes.
+// windowId may be the top-level frame or any of its child windows.
+- (void)holdWindow:(xcb_window_t)windowId acrossUnmapForDuration:(NSTimeInterval)duration;
 - (void)animateWindowTransition:(xcb_window_t)windowId
                                                 fromRect:(XCBRect)startRect
                                                     toRect:(XCBRect)endRect

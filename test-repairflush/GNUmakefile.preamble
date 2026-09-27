@@ -47,6 +47,7 @@ WM_COLLABORATORS = \
 	../WindowManager/URSUtilityRestackOrder.m \
 	../WindowManager/URSSheetLayout.m \
 	../WindowManager/URSAttachmentSlideEffect.m \
+	../WindowManager/URSHoldLastFrameEffect.m \
 	../WindowManager/URSSheetSlideEffect.m \
 	../WindowManager/URSAttachmentRegistry.m \
 	../WindowManager/URSWindowRole.m \

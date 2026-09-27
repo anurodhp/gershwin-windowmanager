@@ -16,6 +16,7 @@
 #import "URSShapePath.h"
 #import "URSShadowOverrides.h"
 #import "URSProfiler.h"
+#import "URSHoldLastFrameEffect.h"
 #import "XCBScreen.h"
 #import <xcb/xcb.h>
 #import <xcb/composite.h>
@@ -3494,6 +3495,25 @@ static inline xcb_render_transform_t URSIdentityTransform(void) {
 - (id<URSWindowEffect>)effectOnWindow:(xcb_window_t)windowId {
     URSCompositeWindow *cw = [self findCWindow:windowId];
     return cw.effect ?: cw.heldEffect;
+}
+
+// windowId's frame's own unmap (its client closing) is a separate XCB event
+// from the one that unmaps an attached sheet or drawer, so nothing ties
+// their timing together on its own: without this, the frame's picture is
+// freed the instant its own unmap is processed while the attached window's
+// dismiss effect (already playing, held alive by its own
+// keepsContentAfterUnmap) keeps painting for the rest of its duration - the
+// parent then appears to close before the sheet has finished sliding away.
+// Playing a no-op effect here reuses the exact same "keep the picture,
+// finish naturally" path an effect already gets on its own unmap.
+- (void)holdWindow:(xcb_window_t)windowId acrossUnmapForDuration:(NSTimeInterval)duration {
+    if (!self.compositingActive || windowId == XCB_NONE) {
+        return;
+    }
+    xcb_window_t topLevel = [self topLevelFrameForWindow:windowId];
+    [self setKeepsContentAfterUnmap:YES forWindow:topLevel];
+    [self playEffect:[[URSHoldLastFrameEffect alloc] initWithDuration:duration]
+             onWindow:topLevel];
 }
 
 static inline NSRect URSWindowRectOf(URSCompositeWindow *cw) {

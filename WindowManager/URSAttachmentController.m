@@ -569,9 +569,18 @@
         [[_connection windowForXCBId:window] setStackedBelowWindow:nil];
         [self returnFocusFromWindow:window toParent:parent];
         if ([self.compositingManager compositingActive]) {
-            [self.compositingManager playEffect:[[URSAttachmentSlideEffect alloc]
-                                                    initAppearing:NO outward:edge]
-                                       onWindow:window];
+            URSAttachmentSlideEffect *slideOut = [[URSAttachmentSlideEffect alloc]
+                                                     initAppearing:NO outward:edge];
+            [self.compositingManager playEffect:slideOut onWindow:window];
+            // A plain -[NSWindow close] while this window was up ends it
+            // (here) first and then closes the parent right after - the
+            // parent's own unmap is a separate event with no effect of its
+            // own, so without this it would vanish before this slide-out
+            // has finished playing.  A little longer than the slide-out
+            // itself so the parent's own disappearance never seems to cut
+            // the tail of the slide short.
+            [self.compositingManager holdWindow:parent
+                          acrossUnmapForDuration:[slideOut duration] + 0.25];
         }
         return;
     }

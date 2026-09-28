@@ -238,6 +238,10 @@ static NSMutableDictionary *frameBorders = nil;
 static NSMutableDictionary *publishedButtonRects = nil;
 // Frame window id -> NSNumber BOOL: whether its titlebar was last drawn active.
 static NSMutableDictionary *drawnActiveStates = nil;
+// The frame the focused application works in.  Focus can pass to a utility
+// window, which must not take the active chrome away from this one (see
+// +activeFrameIdsForFocusedFrame:connection:).
+static xcb_window_t primaryActiveFrameId = XCB_NONE;
 
 + (BOOL)titlebar:(XCBTitleBar *)titlebar isCurrentForFrame:(XCBFrame *)frame active:(BOOL)active
 {
@@ -301,6 +305,12 @@ static NSMutableDictionary *drawnActiveStates = nil;
 
     [publishedButtonRects removeObjectForKey:key];
     [drawnActiveStates removeObjectForKey:key];
+    // X recycles window ids, so a destroyed frame must not stay recorded as
+    // the primary one: a later window with the same id would inherit the
+    // active chrome of an application it does not belong to.
+    if (primaryActiveFrameId == [window window]) {
+        primaryActiveFrameId = XCB_NONE;
+    }
 
     if (record == nil) {
         return;
@@ -1962,21 +1972,132 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
 
 #pragma mark - Titlebar Management
 
+/* Which frames wear the active chrome for the given focus.
+ *
+ * Activation follows the application, not the single focused window: a utility
+ * window - a palette, an inspector - never takes the active state away from
+ * the frame its application works in, and every utility window of the focused
+ * application stays active for as long as that application holds focus.
+ * Ordinary windows keep the one-active-window rule, so two documents of the
+ * same application still trade the active chrome with each other, and focus
+ * moving to another application dims this one completely.
+ *
+ * A frame with no focus to read (focus sits in a menu or tooltip) falls back
+ * to the primary frame; with no primary either, nothing wears the chrome. */
++ (NSSet *)activeFrameIdsForFocusedFrame:(XCBFrame *)focusedFrame
+                              connection:(XCBConnection *)connection
+{
+    EWMHService *ewmh = [EWMHService sharedInstanceWithConnection:connection];
+    NSMutableSet *activeIds = [NSMutableSet set];
+    XCBFrame *primaryFrame = nil;
+    XCBWindow *focusClient = nil;
+    BOOL focusIsUtility = NO;
+    uint32_t focusPid = (uint32_t)-1;
+
+    if (primaryActiveFrameId != XCB_NONE) {
+        XCBWindow *primary = [connection windowForXCBId:primaryActiveFrameId];
+        if ([primary isKindOfClass:[XCBFrame class]]) {
+            primaryFrame = (XCBFrame *)primary;
+        }
+    }
+    if (focusedFrame == nil) {
+        focusedFrame = primaryFrame;
+    }
+    if (focusedFrame == nil) {
+        return activeIds;
+    }
+
+    focusClient = [focusedFrame childWindowForKey:ClientWindow];
+    if (focusClient != nil) {
+        focusIsUtility = [[focusClient windowType]
+            isEqualToString:[ewmh EWMHWMWindowTypeUtility]];
+        focusPid = [ewmh netWMPidForWindow:focusClient];
+    }
+
+    if (!focusIsUtility) {
+        primaryActiveFrameId = [focusedFrame window];
+    }
+    [activeIds addObject:[NSNumber numberWithUnsignedInt:[focusedFrame window]]];
+
+    // Focus sits in a utility window: the frame the application works in was
+    // active a moment ago and stays active, so clicking a palette does not dim
+    // the document behind it.  The two must belong to the same application -
+    // without a PID on the focused window that cannot be told, and the old
+    // one-active-window rule is the safe answer.
+    if (focusIsUtility && focusPid != (uint32_t)-1
+        && primaryFrame != nil
+        && [primaryFrame window] != [focusedFrame window]) {
+        XCBWindow *primaryClient = [primaryFrame childWindowForKey:ClientWindow];
+        if (primaryClient != nil
+            && [ewmh netWMPidForWindow:primaryClient] == focusPid) {
+            [activeIds addObject:
+                [NSNumber numberWithUnsignedInt:[primaryFrame window]]];
+        }
+    }
+
+    // Every utility window of the focused application wears the active chrome
+    // while that application is the one focused, whichever of its windows
+    // holds the focus right now.
+    if (focusPid != (uint32_t)-1) {
+        for (XCBWindow *candidate in [[connection windowsMap] allValues]) {
+            XCBWindow *client;
+
+            if (![candidate isKindOfClass:[XCBFrame class]]) {
+                continue;
+            }
+            client = [(XCBFrame *)candidate childWindowForKey:ClientWindow];
+            if (client == nil
+                || ![[client windowType]
+                        isEqualToString:[ewmh EWMHWMWindowTypeUtility]]
+                || [ewmh netWMPidForWindow:client] != focusPid) {
+                continue;
+            }
+            [activeIds addObject:
+                [NSNumber numberWithUnsignedInt:[candidate window]]];
+        }
+    }
+
+    return activeIds;
+}
+
 + (void)refreshAllTitlebarsWithFocusedWindow:(xcb_window_t)focusedClientId {
     URSThemeIntegration *integration = [URSThemeIntegration sharedInstance];
+    XCBFrame *focusedFrame = nil;
+    XCBConnection *connection = nil;
+    NSSet *activeIds = nil;
 
     if (!integration.enabled) {
         return;
     }
 
+    // Resolve the focused client to its frame first, so a refresh wears the
+    // same chrome a focus change would: the active application's utility
+    // windows included, one ordinary window at a time.
     for (XCBTitleBar *titlebar in [integration.managedTitlebars titlebars]) {
         // Determine if window has keyboard focus by comparing its client
         // window against the focus manager's lastFocusedWindowId.
         XCBFrame *frame = (XCBFrame *)[titlebar parentWindow];
         XCBWindow *clientWindow = [frame childWindowForKey:ClientWindow];
-        BOOL isActive = (focusedClientId != XCB_NONE &&
-                         clientWindow != nil &&
-                         [clientWindow window] == focusedClientId);
+
+        if (connection == nil) {
+            connection = [titlebar connection];
+        }
+        if (focusedClientId != XCB_NONE && clientWindow != nil &&
+            [clientWindow window] == focusedClientId) {
+            focusedFrame = frame;
+            break;
+        }
+    }
+    if (connection == nil) {
+        return;
+    }
+    activeIds = [self activeFrameIdsForFocusedFrame:focusedFrame
+                                          connection:connection];
+
+    for (XCBTitleBar *titlebar in [integration.managedTitlebars titlebars]) {
+        XCBFrame *frame = (XCBFrame *)[titlebar parentWindow];
+        BOOL isActive = [activeIds containsObject:
+                         [NSNumber numberWithUnsignedInt:[frame window]]];
 
         [self renderGSThemeTitlebar:titlebar
                               title:titlebar.windowTitle
@@ -1990,6 +2111,10 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
                           connection:(XCBConnection *)connection {
     NSDictionary *allWindows = [connection windowsMap];
     NSMutableArray *redrawn = [NSMutableArray array];
+    // Focus moved to activeFrame; which frames that leaves active also depends
+    // on utility windows, so the decision is made once, up front.
+    NSSet *activeIds = [self activeFrameIdsForFocusedFrame:activeFrame
+                                                 connection:connection];
     for (NSString *wid in allWindows) {
         XCBWindow *window = [allWindows objectForKey:wid];
         if (![window isKindOfClass:[XCBFrame class]]) {
@@ -2000,7 +2125,8 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
         if (!titlebar) {
             continue;
         }
-        BOOL active = (frame == activeFrame);
+        BOOL active = [activeIds containsObject:
+                       [NSNumber numberWithUnsignedInt:[frame window]]];
         [frame setIsAbove:active];
         [titlebar setIsAbove:active];
         // Every focus change came here twice (when the WM moves focus and

@@ -3049,6 +3049,29 @@ static inline BOOL URSRectIntersects(xcb_rectangle_t a, xcb_rectangle_t b) {
             (int32_t)a.y < bB && (int32_t)b.y < aB);
 }
 
+// Overlap of two rects, as {0,0,0,0} when they do not overlap.  Used to build
+// a paint clip on the CPU side: both operands are already known here, so the
+// intersection costs no X round trip, unlike intersecting two server regions.
+static inline xcb_rectangle_t URSRectIntersection(xcb_rectangle_t a,
+                                                  xcb_rectangle_t b) {
+    if (a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0) {
+        return (xcb_rectangle_t){ 0, 0, 0, 0 };
+    }
+    int32_t x = (int32_t)a.x > (int32_t)b.x ? (int32_t)a.x : (int32_t)b.x;
+    int32_t y = (int32_t)a.y > (int32_t)b.y ? (int32_t)a.y : (int32_t)b.y;
+    int32_t aR = (int32_t)a.x + (int32_t)a.width;
+    int32_t aB = (int32_t)a.y + (int32_t)a.height;
+    int32_t bR = (int32_t)b.x + (int32_t)b.width;
+    int32_t bB = (int32_t)b.y + (int32_t)b.height;
+    int32_t R = aR < bR ? aR : bR;
+    int32_t B = aB < bB ? aB : bB;
+    if (R <= x || B <= y) {
+        return (xcb_rectangle_t){ 0, 0, 0, 0 };
+    }
+    return (xcb_rectangle_t){ (int16_t)x, (int16_t)y,
+                              (uint16_t)(R - x), (uint16_t)(B - y) };
+}
+
 - (xcb_xfixes_region_t)getScreenRegion {
     xcb_connection_t *conn = [self.connection connection];
     
@@ -4422,36 +4445,59 @@ static const double URSProjectiveEdgeMargin = 0.25;
                 continue;
             }
 
-            // Clip the window's OPAQUE composite to its full window rect
-            // (frame + client), not to the damage sub-rectangle.  The frame's
-            // grey back_pixel is part of the frame drawable; a composite
-            // restricted to the damage region leaves previously-painted frame
-            // pixels stale, so that back_pixel can leak through as a dark
-            // border.  The composite fully re-covers its rect, which also
-            // heals any transient back_pixel captured while the client was
-            // still rendering.  The semi-transparent shadow strips must NOT
-            // use this clip - paintWindow: switches them to the fresh region
-            // (see below) so they are never composited over stale pixels.
+            // Clip the window's OPAQUE composite to the part of its rect that
+            // this cycle's damage refreshed, rather than to the whole window
+            // rect.  Two invariants make that safe, and the first is the one
+            // an earlier "restrict it to the damage sub-rectangle" attempt got
+            // wrong:
+            //
+            //  1. The clip is never SMALLER than what the background fill
+            //     erased.  damageBBox is the bounding box of the damage
+            //     region, so paintRect = damageBBox intersect winRect always
+            //     contains region intersect winRect: the composite covers at
+            //     least the erased pixels, so nothing erased can be left
+            //     stale.  That is what let the frame's grey back_pixel bleed
+            //     through as a dark border when the clip was the raw damage
+            //     sub-rectangle.  For the window that generated the damage,
+            //     damageBBox contains its extents and therefore its whole
+            //     rect, so its clip is exactly what it was when this was the
+            //     full window rect - only windows that merely overlap it
+            //     shrink.
+            //  2. It is a region clip, not a rectangle clip layered on the
+            //     damage-region clip set above.  set_picture_clip_rectangles
+            //     does not reliably replace a region clip, which is how the
+            //     two used to combine into something smaller than either; a
+            //     region clip made here always replaces it.
+            //
+            // The frame's grey under its children is covered in the same pass:
+            // each child clips to paintRect intersect its own rect, and the
+            // walk is bottom-up, so the union of the chain repaints all of
+            // paintRect.  The semi-transparent shadow strips must NOT use this
+            // clip - paintWindow: switches them to the fresh region (see
+            // below) so they are never composited over stale pixels.
             xcb_rectangle_t winRect = { cw.x, cw.y,
                 (uint16_t)(cw.width + 2 * cw.borderWidth),
                 (uint16_t)(cw.height + 2 * cw.borderWidth) };
-            // Clip the opaque composite to the FULL window rect.  Use a region
-            // clip (set_picture_clip_region) rather than set_picture_clip_rectangles:
-            // the two clip mechanisms are not mutually exclusive on every X server,
-            // so a rectangle clip does not reliably replace the damage-region clip
-            // set above.  The result was the composite being silently restricted to
-            // the damage sub-rectangle, leaving the rest of the window stale and
-            // the frame's grey back_pixel bleeding through.  A region clip made
-            // from the same rect always replaces the damage-region clip.
+            xcb_rectangle_t paintRect = URSRectIntersection(paintedBBox, winRect);
             /* Only the part of the window its shape shows: outside it the
              * window's pixmap holds whatever was left there, and a shaped
              * window - a drag image - was painted as a rectangle of it.  The
              * clip is made relative to the window and put in place through
              * its origin: the window can have moved by any of several paths
              * since its shape was fetched. */
-            xcb_rectangle_t winLocal = { 0, 0, winRect.width, winRect.height };
+            xcb_rectangle_t winLocal = { (int16_t)(paintRect.x - winRect.x),
+                                          (int16_t)(paintRect.y - winRect.y),
+                                          paintRect.width, paintRect.height };
             xcb_xfixes_region_t winClip = xcb_generate_id(conn);
-            xcb_xfixes_create_region(conn, winClip, 1, &winLocal);
+            if (paintRect.width == 0 || paintRect.height == 0) {
+                // Damage only reached this window's shadow.  paintWindow: must
+                // still run - it is also what creates and repaints the shadow -
+                // but the opaque composite has nothing to refresh, so an empty
+                // region turns it into a no-op instead of a full-window paint.
+                xcb_xfixes_create_region(conn, winClip, 0, NULL);
+            } else {
+                xcb_xfixes_create_region(conn, winClip, 1, &winLocal);
+            }
             xcb_xfixes_region_t shown = [self shapeRegionForWindow:cw];
             if (shown != XCB_NONE) {
                 xcb_xfixes_intersect_region(conn, winClip, shown, winClip);
@@ -4471,28 +4517,30 @@ static const double URSProjectiveEdgeMargin = 0.25;
             self.currentWindowClip = XCB_NONE;
             xcb_xfixes_destroy_region(conn, winClip);
             if (windowPainted) {
-                // The opaque composite refreshed the window rect, so shadows that
-                // overlap it may be repainted over it this cycle.
-                if (freshRegion != XCB_NONE) {
-                    xcb_xfixes_region_t winRegion = xcb_generate_id(conn);
-                    xcb_xfixes_create_region(conn, winRegion, 1, &winRect);
-                    xcb_xfixes_union_region(conn, freshRegion, winRegion, freshRegion);
-                    xcb_xfixes_destroy_region(conn, winRegion);
+                // The opaque composite refreshed exactly paintRect, so shadows
+                // overlapping that area may be repainted over it this cycle.
+                // It has to be paintRect and not the whole window rect: a
+                // shadow composited over pixels this pass did NOT refresh
+                // lands on its own previous-frame pixels and darkens a little
+                // more every cycle ("shadow drawn multiple times").
+                if (freshRegion != XCB_NONE
+                    && paintRect.width > 0 && paintRect.height > 0) {
+                    xcb_xfixes_region_t painted = xcb_generate_id(conn);
+                    xcb_xfixes_create_region(conn, painted, 1, &paintRect);
+                    xcb_xfixes_union_region(conn, freshRegion, painted, freshRegion);
+                    xcb_xfixes_destroy_region(conn, painted);
                 }
 
-                // This window now owns its full extents in the root buffer, so
-                // any higher window overlapping it must also be repainted this
-                // cycle to stay on top.
-                int32_t bx = MIN(paintedBBox.x, windowBBox.x);
-                int32_t by = MIN(paintedBBox.y, windowBBox.y);
-                int32_t bx2 = MAX((int32_t)paintedBBox.x + (int32_t)paintedBBox.width,
-                                  (int32_t)windowBBox.x + (int32_t)windowBBox.width);
-                int32_t by2 = MAX((int32_t)paintedBBox.y + (int32_t)paintedBBox.height,
-                                  (int32_t)windowBBox.y + (int32_t)windowBBox.height);
-                paintedBBox.x = bx;
-                paintedBBox.y = by;
-                paintedBBox.width = (uint16_t)(bx2 - bx);
-                paintedBBox.height = (uint16_t)(by2 - by);
+                // paintedBBox deliberately does NOT grow to the window's
+                // extents here.  It only ever grew because the composite
+                // covered the whole window rect and so overwrote pixels of
+                // higher windows, which then had to be repainted too.  Every
+                // window in this branch now clips to paintedBBox intersect its
+                // own rect, which is always inside paintedBBox, so nothing is
+                // repainted outside it and no higher window can be left
+                // showing stale pixels.  The animating branch below still
+                // expands it, since those windows paint their whole animation
+                // union.
             }
         } else {
             // Animating windows move every frame; the animation timer damages

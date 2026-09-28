@@ -3615,6 +3615,21 @@ static inline xcb_render_transform_t URSIdentityTransform(void) {
     [self setKeepsContentAfterUnmap:YES forWindow:topLevel];
     [self playEffect:[[URSHoldLastFrameEffect alloc] initWithDuration:duration]
              onWindow:topLevel];
+
+    // Freeze the content while the window is still mapped.  The picture a
+    // window paints from is a live IncludeInferiors view of its frame, so the
+    // instant the client unmaps it has no content left to show - while the
+    // shadow, a separate pixmap, carries on painting for the whole hold.  The
+    // parent would then sit there as a bare shadow with a hole in it.  This is
+    // the same snapshot a close animation takes, and unmapWindow: keeps it
+    // alive across the unmap for it; if the window is still on screen when the
+    // hold ends, finishAnimationForWindow: drops the snapshot again.
+    // Only when the hold actually started: a refused effect (the window is
+    // already animating) would otherwise leave a snapshot behind unused.
+    URSCompositeWindow *cw = [self findCWindow:topLevel];
+    if (cw && cw.animating && cw.viewable) {
+        [self captureCloseSnapshotForWindow:cw];
+    }
 }
 
 static inline NSRect URSWindowRectOf(URSCompositeWindow *cw) {
@@ -4108,6 +4123,21 @@ static const double URSProjectiveEdgeMargin = 0.25;
         [self freeWindowData:cw delete:NO];
     } else if (!cw.viewable) {
         [self freeWindowData:cw delete:NO];
+    } else if (cw.snapshotPixmap != XCB_NONE) {
+        // The window outlived the effect (a parent held across its sheet's
+        // dismiss, which then did not close the parent).  It is still on
+        // screen, so it has to go back to painting from the live drawable -
+        // the snapshot is a frozen copy taken when the hold began, and
+        // keeping it would freeze the window for good.
+        xcb_connection_t *conn = [self.connection connection];
+        if (cw.picture != XCB_NONE) {
+            xcb_render_free_picture(conn, cw.picture);
+            cw.picture = XCB_NONE;
+        }
+        xcb_free_pixmap(conn, cw.snapshotPixmap);
+        cw.snapshotPixmap = XCB_NONE;
+        cw.pictureValid = NO;
+        cw.needsPictureCreation = YES;
     }
 
     // Fire the completion callback if set (used e.g. to unmap the window

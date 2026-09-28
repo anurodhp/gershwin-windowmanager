@@ -84,13 +84,13 @@ WM_COLLABORATORS = \
 	../WindowManager/xcb/utils/Comparators.m \
 	../WindowManager/xcb/utils/Transformers.m
 
-repairflush_OBJC_FILES += repairflush_unit.m $(WM_COLLABORATORS)
+repairflush_OBJC_FILES += support/repairflush_unit.m $(WM_COLLABORATORS)
 
 # repairflush.m (Testing.h/PASS) stays non-ARC on purpose - see its header
 # comment.  Everything it calls into (the unit under test and its
 # collaborators) needs the same ARC mode as the real WindowManager build.
 ARCFLAGS = -std=c99 -fobjc-arc -fblocks -D_GNU_SOURCE
-$(foreach f,$(WM_COLLABORATORS) repairflush_unit.m,$(eval $(f)_FILE_FLAGS += $(ARCFLAGS)))
+$(foreach f,$(WM_COLLABORATORS) support/repairflush_unit.m,$(eval $(f)_FILE_FLAGS += $(ARCFLAGS)))
 
 ADDITIONAL_TOOL_LIBS += -lgnustep-gui \
 	$(shell pkg-config --libs xcb xcb-icccm xcb-xfixes xcb-aux xcb-cursor xcb-shape xcb-randr) \

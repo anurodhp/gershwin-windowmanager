@@ -1269,6 +1269,12 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
     URSCompositeWindow *cw = [self findCWindow:windowId];
     if (cw.viewable) {
         cw.damaged = YES;
+        // Composited for the first time: what sits under it on screen is not
+        // its content, and no client draw ever describes that.  Before the
+        // damage delta this rode along with every other window's extents;
+        // now the region is only as large as whatever else changed, which
+        // would leave a window adopted mid-run showing what was behind it.
+        [self damageWindowArea:cw];
     }
 }
 
@@ -1703,15 +1709,29 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
 
 #pragma mark - No-Shadow Window Registration
 
+// Whether a window has a shadow decides the pixels over its whole ring, which
+// no client draw ever covers.  Damaging the extents here is what makes the
+// override take effect now: before it only appeared on the window's next
+// unrelated redraw, and with a damage delta that redraw no longer reaches the
+// ring at all, so the old shadow would stay on screen indefinitely.
+- (void)damageShadowOverrideForWindow:(xcb_window_t)windowId {
+    URSCompositeWindow *cw = [self findCWindow:windowId];
+    if (cw && cw.viewable) {
+        [self damageWindowArea:cw];
+    }
+}
+
 - (void)setSkipShadowForWindow:(xcb_window_t)windowId {
     if (windowId != XCB_NONE) {
         [self.shadowOverrides setSkipsShadow:YES forWindow:windowId];
+        [self damageShadowOverrideForWindow:windowId];
     }
 }
 
 - (void)clearSkipShadowForWindow:(xcb_window_t)windowId {
     if (windowId != XCB_NONE) {
         [self.shadowOverrides setSkipsShadow:NO forWindow:windowId];
+        [self damageShadowOverrideForWindow:windowId];
     }
 }
 
@@ -2629,7 +2649,9 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
         return;
     }
 
-    [self repairWindow:cw];
+    // Full extents, not the damage delta: by definition there is no X Damage
+    // behind this call to read a delta from.
+    [self repairWindowFully:cw];
 
     // repairWindow only accumulates damage - without scheduling a composite
     // pass the new content would sit unscreened until some other damage
@@ -2747,6 +2769,17 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
 }
 
 - (void)repairWindow:(URSCompositeWindow *)cw {
+    [self repairWindow:cw useFullExtents:NO];
+}
+
+// Entry point for a caller whose drawing never produces Damage events (the
+// titlebar spinner): there is no X Damage to read a delta from, so the whole
+// extents have to be repainted or the nudged window keeps its stale picture.
+- (void)repairWindowFully:(URSCompositeWindow *)cw {
+    [self repairWindow:cw useFullExtents:YES];
+}
+
+- (void)repairWindow:(URSCompositeWindow *)cw useFullExtents:(BOOL)fullExtents {
     xcb_connection_t *conn = [self.connection connection];
 
     // Never invalidate the frozen snapshot of a close-animating window (see
@@ -2757,16 +2790,53 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
         return;
     }
 
-    // Always use full window extents instead of the delta from
-    // xcb_damage_subtract.  The X Damage extension may report a sub-rect
-    // that is smaller than the visual area needing update (e.g. just the
-    // text background of a menu item).  If we passed a partial rectangle
-    // to addDamage: then the clip region in paintAll: would restrict the
-    // final composite to that subset, leaving parts of the window stale.
-    xcb_xfixes_region_t parts = [self windowExtents:cw];
+    // The delta out of xcb_damage_subtract says which pixels actually
+    // changed, and that is exactly the set paintAll: may repaint: it clips
+    // the background fill, the window composite, the shadow strips and the
+    // final present to this region, so a region wider than the change is
+    // painted for nothing and a region narrower than it leaves stale pixels.
+    // Two cases still have to fall back to the whole extents:
+    //
+    //  - no damage has ever been repaired for this window, so its content is
+    //    described by no delta.  This is also what lifts the first-content
+    //    gate in paintWindow: and lets detectTransparentBackground: read a
+    //    defined backing store, so it has to stay set on the first repair.
+    //    Every other path that invalidates content (mapWindow:, unmapWindow:,
+    //    addWindow:) clears this flag for the same reason.
+    //  - the caller said so (repairWindowFully:), for drawing that bypasses
+    //    the damage pipeline entirely.
+    //
+    // A missing shadow deliberately does NOT force full extents: the ring
+    // lies outside every client draw and no delta will ever describe it, but
+    // the place that creates the shadow - paintWindow: - damages the extents
+    // itself, right there, so the ring is staged for that pass's present.
+    // Making every shadowless window repaint in full would cost far more than
+    // it saves (menus, popups and the skip-shadow Dock never grow one).
+    BOOL establish = fullExtents || !cw.damaged;
 
-    // Drain all accumulated damage so the X damage object starts fresh.
-    xcb_damage_subtract(conn, cw.damage, XCB_NONE, XCB_NONE);
+    xcb_xfixes_region_t parts = XCB_NONE;
+    if (establish) {
+        parts = [self windowExtents:cw];
+        // Drain all accumulated damage so the X damage object starts fresh.
+        if (cw.damage != XCB_NONE) {
+            xcb_damage_subtract(conn, cw.damage, XCB_NONE, XCB_NONE);
+        }
+    } else if (cw.damage != XCB_NONE) {
+        // The drained damage comes back in the space of the window the
+        // Damage object was created on - cw.windowId, the space cw.x/cw.y
+        // already locate, since updateAbsolutePositionForWindow: derives them
+        // from translate_coordinates(windowId -> root, 0, 0).  windowExtents:
+        // has trusted those two the same way, so this adds no new assumption
+        // about their freshness - but the result is in window space while
+        // addDamage: intersects against the root-space screen region, so it
+        // has to be translated here.  One extra request, and the object
+        // re-arms on this subtract, which is what keeps it from accumulating
+        // the window's whole draw history.
+        parts = xcb_generate_id(conn);
+        xcb_xfixes_create_region(conn, parts, 0, NULL);
+        xcb_damage_subtract(conn, cw.damage, XCB_NONE, parts);
+        xcb_xfixes_translate_region(conn, parts, cw.x, cw.y);
+    }
 
     // The window picture is a live view of the window drawable (see
     // getWindowPicture:), so it always reads current content at composite
@@ -2786,8 +2856,16 @@ static const NSTimeInterval URSStartupHoldLimit = 1.0;
 
     if (parts != XCB_NONE) {
         [self addDamage:parts];
-        cw.damaged = YES;
     }
+
+    // Unconditional, as it always was: windowExtents: produced a region on
+    // every call, so before the delta path every repair marked the window
+    // drawn - including when the client's redraw turned out to describe
+    // nothing new.  The gates that read it (the first-content gate in
+    // paintWindow:, the transparency probe, paintMenuShadow:) must keep
+    // seeing that, and an empty delta must not be mistaken for "the client
+    // has never painted".
+    cw.damaged = YES;
 
     // No flush here on purpose.  repairWindow: runs once per DamageNotify,
     // and on a busy client (a scrolling terminal) that is many times a
@@ -4221,6 +4299,9 @@ static const double URSProjectiveEdgeMargin = 0.25;
 
     if (cw.shadowPicture == XCB_NONE && ![self.connection resizeState]) {
         [self createShadowForWindow:cw];
+        // Same reason as in paintWindow: - the ring is outside every client
+        // draw, so nothing else will stage it for the present.
+        [self damageWindowArea:cw];
     }
     if (cw.shadowPicture == XCB_NONE) return;
     if (!cw.damaged) return;
@@ -5552,11 +5633,21 @@ static double URSShapeCoverage(const uint8_t *shape, int width, int height,
                                 cw.shadowHeight != expectedShadowHeight);
 
         if (![self.connection resizeState] && shadowSizeStale) {
+            // Damaged while the old shadow is still the current one: its ring
+            // can be larger than the replacement, and the leftover fringe is
+            // outside the extents windowExtents: reports after the swap.
+            [self damageWindowArea:cw];
             [self discardShadowForWindow:cw];
         }
 
         if (cw.shadowPicture == XCB_NONE && ![self.connection resizeState]) {
             [self createShadowForWindow:cw];
+            // The ring lies outside every client draw, so no damage delta
+            // will ever describe it.  paintAll: paints the strips only where
+            // freshRegion reaches and the present only stages what was
+            // damaged, so without this the new shadow shows up partially -
+            // or never reaches the screen at all.
+            [self damageWindowArea:cw];
         }
     }
 #endif

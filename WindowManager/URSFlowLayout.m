@@ -21,7 +21,18 @@ static const double URSFlowCameraDistance = 3.8;
 static const double URSFlowSideDepth = 2.5;
 // ItemFlow turns side items by 70 degrees and lets the perspective taper
 // show the turn.  A scaled rectangle has no taper, so a milder turn keeps
-// the narrowed windows recognizable.
+// the side windows recognizable.
+//
+// The turn has to be applied to BOTH axes or not at all.  Scaling the width
+// alone narrows a window without narrowing its height, which is the picture
+// being squashed: a 16:9 window came out nearly square and the user sees a
+// stretched window, not a turned one.  This layout is handed to the
+// compositor as a paint rect, and the compositor scales the window's picture
+// into it, so whatever shape the rect has is the shape the user sees - the
+// row cannot show a real 3D turn, which would need the projective transform
+// that presentations are not given (see gershwin-compositor-window-effects).
+// So the side items simply recede: one factor on both axes, which keeps every
+// window's own proportions.
 static const double URSFlowSideAngle = 60.0;
 // Horizontal distances, in half widths of the chosen window's box, from the
 // middle to the first neighbour and between further neighbours.  ItemFlow
@@ -57,8 +68,9 @@ static const double URSFlowCoverSpacing = 0.40;
         (URSFlowCameraDistance + URSFlowSideDepth * distance);
     double turn = cos(URSFlowSideAngle * distance * M_PI / 180.0);
 
-    double width = windowSize.width * fit * depthScale * turn;
-    double height = windowSize.height * fit * depthScale;
+    double scale = fit * depthScale * turn;
+    double width = windowSize.width * scale;
+    double height = windowSize.height * scale;
     double midX = NSMidX(area) + across * halfBox;
     double midY = NSMinY(area) + NSHeight(area) * URSFlowRowCentre;
     return NSMakeRect(midX - width * 0.5, midY - height * 0.5, width, height);

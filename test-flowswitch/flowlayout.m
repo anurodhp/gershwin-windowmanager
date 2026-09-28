@@ -30,6 +30,20 @@ static double areaOf(NSRect r)
   return NSWidth(r) * NSHeight(r);
 }
 
+// A window is shown at its own proportions, or scaled by one factor in both
+// axes.  Anything else is the image being squashed.
+static double aspectOf(NSRect r)
+{
+  return NSWidth(r) / NSHeight(r);
+}
+
+static BOOL keepsAspect(NSRect slot, NSSize window)
+{
+  double a = aspectOf(slot);
+  double b = window.width / window.height;
+  return fabs(a - b) < 0.02 * b;
+}
+
 static BOOL inside(NSRect s, NSRect area)
 {
   return NSMinX(s) >= NSMinX(area) - 0.5 && NSMinY(s) >= NSMinY(area) - 0.5
@@ -117,11 +131,43 @@ int main(void)
     PASS(receding, "windows get no bigger away from the chosen one");
     PASS(NSHeight(slotAt(slots, 4)) < NSHeight(slotAt(slots, 3)),
          "a neighbour is smaller than the chosen window");
-    PASS(NSWidth(slotAt(slots, 4)) / NSHeight(slotAt(slots, 4))
-         < NSWidth(slotAt(slots, 3)) / NSHeight(slotAt(slots, 3)),
-         "a neighbour is turned away, narrower than its shape");
+    PASS(NSWidth(slotAt(slots, 4)) < NSWidth(slotAt(slots, 3)),
+         "a neighbour is narrower than the chosen window");
+    /* The regression this replaces: a neighbour used to be drawn narrower
+     * than its own proportions, because the side "turn" was faked by scaling
+     * the width alone.  The row is a perspective row, not a projection, so a
+     * turned window cannot be shown by squashing its picture - every window
+     * keeps its own shape and simply recedes. */
+    PASS(keepsAspect(slotAt(slots, 4), s[4]) && keepsAspect(slotAt(slots, 3), s[3])
+         && keepsAspect(slotAt(slots, 5), s[5]) && keepsAspect(slotAt(slots, 0), s[0]),
+         "every window keeps its own aspect ratio while it recedes");
   }
 
+  /* Aspect ratio holds for every window, at every position, whatever shape the
+   * windows are and wherever the row is between two of them. */
+  {
+    NSSize mixed[] = { {1920, 1080}, {600, 900}, {800, 600}, {1000, 400 },
+                       {500, 700 }, { 900, 900}, {1200, 300} };
+    NSArray *w = sizes(7, mixed);
+    BOOL allKept = YES;
+    double worst = 0.0;
+    for (double p = 0.0; p < 7.0; p += 0.05) {
+      NSArray *row = [URSFlowLayout slotsForWindowSizes: w position: p inArea: screen];
+      for (NSUInteger i = 0; i < 7; i++) {
+        NSRect slot = slotAt(row, i);
+        if (NSWidth(slot) <= 0 || NSHeight(slot) <= 0) { allKept = NO; continue; }
+        double want = mixed[i].width / mixed[i].height;
+        double got = aspectOf(slot);
+        double err = fabs(got - want) / want;
+        if (err > worst) worst = err;
+        if (err > 0.02) allKept = NO;
+      }
+    }
+    PASS(allKept, "no window is ever drawn at a different aspect ratio than its own");
+    if (worst > 0.02) {
+      printf("         worst aspect error %.1f%%\n", worst * 100.0);
+    }
+  }
   /* Sliding between two positions moves smoothly. */
   {
     NSSize s[] = { {800, 600}, {800, 600}, {800, 600}, {800, 600} };

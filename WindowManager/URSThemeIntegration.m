@@ -30,6 +30,15 @@
 - (CGFloat)titlebarCornerRadius;
 @end
 
+// Finished titlebar looks, as server-side pixmaps: "<titlebar>|<size>|<style>|
+// <state>|<hover>|<orb>|<title>" -> pixmap id.  Bounded (24) and flushed whole
+// when full, so closed windows' entries do not accumulate.
+static NSMutableDictionary *titlebarRenderCache(void) {
+    static NSMutableDictionary *cache;
+    if (!cache) cache = [[NSMutableDictionary alloc] init];
+    return cache;
+}
+
 @implementation URSThemeIntegration
 
 static URSThemeIntegration *sharedInstance = nil;
@@ -1109,14 +1118,6 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
               (int)titlebarSize.width, (int)titlebarSize.height,
               (int)frameRect.size.width, (int)frameRect.size.height, [window window]);
 
-        // Create NSImage for GSTheme to render into
-        NSImage *titlebarImage = [[NSImage alloc] initWithSize:titlebarSize];
-
-        [titlebarImage lockFocus];
-        
-        // Set up the graphics state for theme drawing
-        NSGraphicsContext *gctx = [NSGraphicsContext currentContext];
-        [gctx saveGraphicsState];
 
         // Use GSTheme to draw titlebar decoration
 
@@ -1153,6 +1154,53 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
         }
 
         GSThemeControlState state = isActive ? GSThemeNormalState : GSThemeSelectedState;
+
+        // iokit port: a full theme render costs ~40 ms on a Pi 3 and the set of
+        // distinct looks is tiny (active/inactive x hovered button), so each
+        // finished titlebar is kept in a server-side pixmap and later requests
+        // for the same look are one xcb_copy_area.  Not used with the
+        // compositor (32-bit pixmaps), while the spinner animates, or while a
+        // resize is dragging through many one-off widths.
+        xcb_connection_t *tbConn = [[titlebar connection] connection];
+        xcb_window_t tbId = [titlebar window];
+        NSInteger tbHoverIdx = (tbId == hoveredTitlebarWindow) ? hoveredButtonIndex : -1;
+        BOOL tbSpinning = [titlebar respondsToSelector:@selector(spinnerRenderFrame)] &&
+                          [(XCBTitleBar *)titlebar spinnerRenderFrame] >= 0;
+        NSString *tbCacheKey = nil;
+        uint8_t tbDepth = 0;
+        if (![[URSCompositingManager sharedManager] compositingActive] && !tbSpinning &&
+            ![titlebar use32BitDepth]) {
+            XCBScreen *tbScreen = [titlebar onScreen];
+            if (!tbScreen) tbScreen = [titlebar screen];
+            if (tbScreen && [tbScreen screen]) tbDepth = [tbScreen screen]->root_depth;
+        }
+        if (tbDepth) {
+            tbCacheKey = [NSString stringWithFormat:@"%u|%dx%d|%lu|%d|%ld|%d|%@", tbId,
+                          (int)titlebarSize.width, (int)titlebarSize.height,
+                          (unsigned long)styleMask, (int)state, (long)tbHoverIdx,
+                          (int)[URSThemeIntegration isOrbButtonStyle], title ?: @""];
+            NSNumber *cached = [titlebarRenderCache() objectForKey:tbCacheKey];
+            if (cached && [titlebar pixmap] && [titlebar dPixmap]) {
+                xcb_pixmap_t src = (xcb_pixmap_t)[cached unsignedIntValue];
+                xcb_gcontext_t tgc = [titlebar graphicContextId];
+                xcb_copy_area(tbConn, src, [titlebar pixmap], tgc, 0, 0, 0, 0,
+                              titlebarSize.width, titlebarSize.height);
+                xcb_copy_area(tbConn, src, [titlebar dPixmap], tgc, 0, 0, 0, 0,
+                              titlebarSize.width, titlebarSize.height);
+                [[titlebar connection] flush];
+                URS_PROFILE_END(themeRender);
+                return YES;
+            }
+        }
+
+        // Create NSImage for GSTheme to render into
+        NSImage *titlebarImage = [[NSImage alloc] initWithSize:titlebarSize];
+
+        [titlebarImage lockFocus];
+
+        // Set up the graphics state for theme drawing
+        NSGraphicsContext *gctx = [NSGraphicsContext currentContext];
+        [gctx saveGraphicsState];
 
         NSDebugLog(@"Drawing standalone GSTheme titlebar with styleMask: 0x%lx, state: %d (fixedSize=%d, mini=%d)", (unsigned long)styleMask, (int)state, (int)isFixedSize, clientWindow ? (int)[clientWindow canMinimize] : 0);
 
@@ -1496,6 +1544,23 @@ typedef NS_ENUM(NSInteger, TitleBarButtonPosition) {
                           0, 0,
                           0, 0,
                           titlebarSize.width, titlebarSize.height);
+
+            // Remember this look (see the cache check above).
+            if (tbCacheKey && ![[frame connection] resizeState]) {
+                NSMutableDictionary *cache = titlebarRenderCache();
+                if ([cache count] >= 24) {
+                    for (NSNumber *stale in [cache allValues]) {
+                        xcb_free_pixmap(c, (xcb_pixmap_t)[stale unsignedIntValue]);
+                    }
+                    [cache removeAllObjects];
+                }
+                xcb_pixmap_t keep = xcb_generate_id(c);
+                xcb_create_pixmap(c, tbDepth, keep, tbId,
+                                  titlebarSize.width, titlebarSize.height);
+                xcb_copy_area(c, [titlebar pixmap], keep, [titlebar graphicContextId],
+                              0, 0, 0, 0, titlebarSize.width, titlebarSize.height);
+                [cache setObject:@(keep) forKey:tbCacheKey];
+            }
 
             NSDebugLog(@"Standalone GSTheme titlebar rendered successfully for: %@", title);
         } else {

@@ -658,10 +658,18 @@ static CGFloat WMLastScaleFactor = 1.0;
 
     // Process any remaining compressed motion event (e.g. motion was last in queue)
     if (lastMotionEvent) {
+        URS_PROFILE_BEGIN(motionConn);
         [connection handleMotionNotify:lastMotionEvent];
+        URS_PROFILE_END(motionConn);
+        URS_PROFILE_BEGIN(motionResize);
         [self.titlebarController handleResizeDuringMotion:lastMotionEvent];
+        URS_PROFILE_END(motionResize);
+        URS_PROFILE_BEGIN(motionComp);
         [self handleCompositingDuringMotion:lastMotionEvent];
+        URS_PROFILE_END(motionComp);
+        URS_PROFILE_BEGIN(motionHover);
         [self.titlebarController handleHoverDuringMotion:lastMotionEvent];
+        URS_PROFILE_END(motionHover);
         needFlush = YES;
         free(lastMotionEvent);
         lastMotionEvent = NULL;
@@ -669,7 +677,9 @@ static CGFloat WMLastScaleFactor = 1.0;
 
     // Batched flush: only flush when needed
     if (needFlush) {
+        URS_PROFILE_BEGIN(flush);
         [connection flush];
+        URS_PROFILE_END(flush);
         [connection setNeedFlush:NO];
     }
     

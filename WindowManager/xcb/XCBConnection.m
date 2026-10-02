@@ -2685,7 +2685,11 @@ static XCBConnection *sharedInstance;
         int16_t destY = frameY + offset.y;
         XCBPoint destPoint = XCBMakePoint(destX, destY);
         [frame moveTo:destPoint];
-        [frame configureClient];
+        // iokit port: the synthetic ConfigureNotify (ICCCM 4.1.5) is sent once
+        // at button release (handleButtonRelease), not on every motion. Sent per
+        // motion it made GNUstep clients (Terminal) redraw on each step: 43% CPU
+        // and a janky drag on the Pi 3. The client's cached rect is still kept
+        // in step with the frame by the release-time call.
 
         // Edge and corner snap detection - check if mouse is near screen edges/corners
         if (self.workareaValid) {
@@ -3442,6 +3446,15 @@ static XCBConnection *sharedInstance;
 
         clientWindow = nil;
     }*/
+
+    // End of a titlebar drag: the one synthetic ConfigureNotify the client gets
+    // for the move (handleMotionNotify no longer sends one per motion).
+    if (dragState && [window isKindOfClass:[XCBTitleBar class]]) {
+        XCBFrame *movedFrame = (XCBFrame *)[window parentWindow];
+        if ([movedFrame isKindOfClass:[XCBFrame class]]) {
+            [movedFrame configureClient];
+        }
+    }
 
     // Execute snap if preview was shown and we're in a snap zone
     if (self.snapPreviewShown && self.pendingSnapZone != SnapZoneNone) {

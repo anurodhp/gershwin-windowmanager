@@ -199,6 +199,42 @@ static void killOtherInstances(void) {
 - (BOOL)isDockPopup:(XCBWindow *)aWindow forDockOwnerLeaders:(NSSet *)dockOwnerLeaders;
 @end
 
+// iokit port: outline ("rubber band") window move, as Window Maker's default
+// OpaqueMove=NO.  Moving a real window repaints it through the X server's
+// software shadow framebuffer on every step, which is what made drags lag on
+// the Pi 3.  Instead a 2 px XOR rectangle is drawn on the root while the
+// pointer moves (server grabbed, so nothing repaints under it) and the window
+// moves once, on release.  XOR drawing is its own inverse, so erasing is
+// drawing the same rectangle again.
+static BOOL gOutline = NO;          // an outline move is in progress
+static BOOL gOutlineDrawn = NO;     // a rectangle is currently on screen
+static int16_t gOutX, gOutY;        // outline frame position
+static uint16_t gOutW, gOutH;
+static int16_t gDestX, gDestY;      // pointer-space destination for -moveTo:
+static xcb_gcontext_t gOutGC = XCB_NONE;
+
+static xcb_window_t outlineRoot(xcb_connection_t *c)
+{
+    return xcb_setup_roots_iterator(xcb_get_setup(c)).data->root;
+}
+
+static void outlineDraw(xcb_connection_t *c, xcb_window_t root)
+{
+    xcb_rectangle_t r = { gOutX, gOutY, gOutW, gOutH };
+    xcb_poly_rectangle(c, root, gOutGC, 1, &r);
+}
+
+// Erases the rectangle, releases the server grab and clears the state.
+static void outlineEnd(xcb_connection_t *c, xcb_window_t root)
+{
+    if (!gOutline) return;
+    if (gOutlineDrawn) outlineDraw(c, root);
+    gOutlineDrawn = NO;
+    gOutline = NO;
+    xcb_ungrab_server(c);
+    xcb_flush(c);
+}
+
 @implementation XCBConnection
 
 @synthesize dragState;
@@ -2626,6 +2662,7 @@ static XCBConnection *sharedInstance;
         if (!(anEvent->state & XCB_KEY_BUT_MASK_BUTTON_1)) {
             //NSLog(@"DRAG SAFETY: dragState was YES but button 1 not pressed — cancelling phantom drag");
             dragState = NO;
+            outlineEnd(connection, outlineRoot(connection));
             [window ungrabPointer];
             return;
         }
@@ -2684,12 +2721,35 @@ static XCBConnection *sharedInstance;
         int16_t destX = frameX + offset.x;
         int16_t destY = frameY + offset.y;
         XCBPoint destPoint = XCBMakePoint(destX, destY);
-        [frame moveTo:destPoint];
-        // iokit port: the synthetic ConfigureNotify (ICCCM 4.1.5) is sent once
-        // at button release (handleButtonRelease), not on every motion. Sent per
-        // motion it made GNUstep clients (Terminal) redraw on each step: 43% CPU
-        // and a janky drag on the Pi 3. The client's cached rect is still kept
-        // in step with the frame by the release-time call.
+        // Outline move (see outlineDraw): no window is touched until release,
+        // where handleButtonRelease moves it and sends the one synthetic
+        // ConfigureNotify (ICCCM 4.1.5) the client needs.
+        {
+            xcb_window_t rootId = outlineRoot(connection);
+            XCBRect fr = [frame windowRect];
+            if (!gOutline) {
+                if (gOutGC == XCB_NONE) {
+                    // XOR with all-ones: every pixel under the line inverts.
+                    uint32_t gcv[4] = { XCB_GX_XOR, 0xFFFFFFFF, 2, XCB_SUBWINDOW_MODE_INCLUDE_INFERIORS };
+                    gOutGC = xcb_generate_id(connection);
+                    xcb_create_gc(connection, gOutGC, rootId,
+                                  XCB_GC_FUNCTION | XCB_GC_FOREGROUND | XCB_GC_LINE_WIDTH |
+                                  XCB_GC_SUBWINDOW_MODE, gcv);
+                }
+                xcb_grab_server(connection);
+                gOutline = YES;
+                gOutlineDrawn = NO;
+            }
+            if (gOutlineDrawn) outlineDraw(connection, rootId);
+            gOutX = frameX;
+            gOutY = frameY;
+            gOutW = fr.size.width > 2 ? fr.size.width - 1 : fr.size.width;
+            gOutH = fr.size.height > 2 ? fr.size.height - 1 : fr.size.height;
+            gDestX = destX;
+            gDestY = destY;
+            outlineDraw(connection, rootId);
+            gOutlineDrawn = YES;
+        }
 
         // Edge and corner snap detection - check if mouse is near screen edges/corners
         if (self.workareaValid) {
@@ -3451,10 +3511,18 @@ static XCBConnection *sharedInstance;
     // for the move (handleMotionNotify no longer sends one per motion).
     if (dragState && [window isKindOfClass:[XCBTitleBar class]]) {
         XCBFrame *movedFrame = (XCBFrame *)[window parentWindow];
+        if (gOutline) {
+            outlineEnd(connection, outlineRoot(connection));
+            if ([movedFrame isKindOfClass:[XCBFrame class]]) {
+                [movedFrame moveTo:XCBMakePoint(gDestX, gDestY)];
+            }
+        }
         if ([movedFrame isKindOfClass:[XCBFrame class]]) {
             [movedFrame configureClient];
         }
     }
+    // Any other way out of a drag must not leave the server grabbed.
+    outlineEnd(connection, outlineRoot(connection));
 
     // Execute snap if preview was shown and we're in a snap zone
     if (self.snapPreviewShown && self.pendingSnapZone != SnapZoneNone) {

@@ -63,20 +63,24 @@ int main(int argc, const char * argv[])
         [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"GSSuppressAppIcon"];
 
         // Parse command-line arguments for compositing mode
-        BOOL enableCompositing = YES;
+        // iokit port: compositing is OFF by default (software XRender on the
+        // Pi 3's ShadowFB costs a full-surface composite per damaged window);
+        // -ec/--enable-compositing opts in, -dc is accepted for compatibility.
+        BOOL enableCompositing = NO;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "-dc") == 0 || strcmp(argv[i], "--disable-compositing") == 0) {
                 enableCompositing = NO;
-                //NSLog(@"[WindowManager] Compositing mode disabled via command-line flag");
-                break;
+            } else if (strcmp(argv[i], "-ec") == 0 || strcmp(argv[i], "--enable-compositing") == 0) {
+                enableCompositing = YES;
             } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                 printf("WindowManager - Objective-C Window Manager\n");
                 printf("Usage: %s [options]\n\n", argv[0]);
                 printf("Options:\n");
-                printf("  -dc, --disable-compositing  Disable XRender compositing\n");
+                printf("  -ec, --enable-compositing   Enable XRender compositing (off by default)\n");
+                printf("  -dc, --disable-compositing  Disable XRender compositing (the default)\n");
                 printf("  -h, --help          Show this help message\n\n");
-                printf("By default, windows use XRender compositing for transparency effects.\n");
-                printf("Use -dc to force traditional direct rendering mode.\n");
+                printf("By default windows use traditional direct rendering.\n");
+                printf("Use -ec to enable XRender compositing for transparency effects.\n");
                 return 0;
             }
         }

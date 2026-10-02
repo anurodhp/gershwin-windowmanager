@@ -103,12 +103,27 @@ $(APP_NAME)_HEADER_FILES = \
 		xcb/utils/Comparators.h \
 		xcb/utils/Transformers.h
 
+# iokit port: no pkg-config on the cross build; xcb_aux lives in libxcb-util.
+ifeq ($(IOKIT_PORT),1)
+XCB_PKG_LIBS = -lxcb -lxcb-icccm -lxcb-xfixes -lxcb-cursor -lxcb-shape -lxcb-randr
+else
+XCB_PKG_LIBS = $(shell pkg-config --libs xcb xcb-icccm xcb-xfixes xcb-aux xcb-cursor xcb-shape xcb-randr)
+endif
+
 $(APP_NAME)_GUI_LIBS = \
-		$(shell pkg-config --libs xcb xcb-icccm xcb-xfixes xcb-aux xcb-cursor xcb-shape xcb-randr) \
+		$(XCB_PKG_LIBS) \
 		-lxcb-util -lX11 -lXext \
 		-lxcb-composite -lxcb-render -lxcb-damage -lxcb-shm -lxcb-present
 
 ADDITIONAL_OBJCFLAGS = -std=c99 -g -O0 -fobjc-arc -fblocks -Wall -Wno-typedef-redefinition -D_GNU_SOURCE
+
+# iokit port: -O2, as in our Eau fork (at -O0 ARC emits retain/storeStrong on
+# global blocks); -fno-builtin-sin/cos because -O2 would fuse sin+cos into
+# __sincos_stret, which this port's libsystem_m does not export.
+ifeq ($(IOKIT_PORT),1)
+ADDITIONAL_OBJCFLAGS = -std=c99 -g -O2 -fobjc-arc -fblocks -Wall -Wno-typedef-redefinition -D_GNU_SOURCE \
+		-fno-builtin-sin -fno-builtin-cos -fno-builtin-sinf -fno-builtin-cosf
+endif
 
 # Profiling: build with  make PROFILE=1  to enable CPU instrumentation.
 # When enabled, a summary is printed every 10s and on SIGUSR1.
